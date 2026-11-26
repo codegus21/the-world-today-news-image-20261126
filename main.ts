@@ -1,671 +1,1007 @@
-// THE WORLD TODAY — Thursday 26 November 2026.
-// A newspaper front page drawn entirely in code: a pixel buffer, a small
-// hand-built 5x7 bitmap font (glyphs as rows of '#' and '.'), and a
-// hand-rolled PNG encoder (zlib deflate + manual PNG chunks). Node 22
-// standard library only, no network, and the same bytes on every run.
-// Leads with Washington's new tariff plan for 14 trading partners, then
-// 63 more stories in 9 sections, a UTC timeline of the day and a pin map
-// of where it all happened.
+// THE WORLD TODAY — front page for Thursday 26 November 2026.
+//
+// This program paints a newspaper front page pixel by pixel and saves it
+// as a 1024 by 1024 PNG. Everything is drawn from scratch in this file:
+// a canvas of raw RGB bytes, a tiny 5-by-7 pixel alphabet, a hand-made
+// PNG writer, and a small PNG reader for the world map. It uses only the
+// Node standard library, never touches the network, and produces the same
+// bytes on every run. The page leads with Washington's tariff plan for 14
+// trading partners and carries 64 stories in 9 sections, a timeline of
+// the day in UTC and a pin map of where the news happened.
+
 import { deflateSync, inflateSync } from "node:zlib";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
-const W = 1024;
-const H = 1024;
+// Page size and the column grid. Three columns, each 304 pixels wide,
+// separated by 14-pixel gutters, inside a 28-pixel outer margin.
+const PAGE_WIDTH = 1024;
+const PAGE_HEIGHT = 1024;
+const MARGIN = 28;
+const COLUMN_WIDTH = 304;
+const GUTTER = 14;
+const COLUMN_LEFT = [
+  MARGIN,
+  MARGIN + COLUMN_WIDTH + GUTTER,
+  MARGIN + 2 * (COLUMN_WIDTH + GUTTER),
+];
 
-// ---- palette ------------------------------------------------------------
-type RGB = [number, number, number];
-const PAPER: RGB = [246, 241, 227];
-const INK: RGB = [18, 18, 18];
-const RED: RGB = [158, 27, 27];
-const BLUE: RGB = [29, 78, 137];
-const GREY: RGB = [90, 86, 76];
-const MAPBG: RGB = [222, 232, 238];
-const LAND: RGB = [150, 165, 175];
-const ORANGE: RGB = [214, 110, 30];
+// The paper and ink colours of the front page.
+type Colour = [number, number, number];
 
-// ---- pixel buffer -------------------------------------------------------
-const buf = new Uint8Array(W * H * 3);
-for (let i = 0; i < W * H; i++) {
-  buf[i * 3] = PAPER[0];
-  buf[i * 3 + 1] = PAPER[1];
-  buf[i * 3 + 2] = PAPER[2];
+const PALETTE: {
+  paper: Colour;
+  ink: Colour;
+  red: Colour;
+  blue: Colour;
+  grey: Colour;
+  amber: Colour;
+} = {
+  paper: [246, 241, 227],
+  ink: [18, 18, 18],
+  red: [158, 27, 27],
+  blue: [29, 78, 137],
+  grey: [90, 86, 76],
+  amber: [214, 110, 30],
+};
+
+// A sheet of RGB pixels. The pixel at (x, y) lives at byte offset
+// (y * width + x) * 3. Dots outside the sheet are ignored, so drawing
+// code never has to clip by hand.
+class Sheet {
+  readonly width: number;
+  readonly height: number;
+  private readonly px: Uint8Array;
+
+  constructor(width: number, height: number, base: Colour) {
+    this.width = width;
+    this.height = height;
+    this.px = new Uint8Array(width * height * 3);
+    for (let i = 0; i < width * height; i++) {
+      this.px[i * 3] = base[0];
+      this.px[i * 3 + 1] = base[1];
+      this.px[i * 3 + 2] = base[2];
+    }
+  }
+
+  dot(x: number, y: number, c: Colour): void {
+    if (x < 0 || y < 0 || x >= this.width || y >= this.height) return;
+    const o = (y * this.width + x) * 3;
+    this.px[o] = c[0];
+    this.px[o + 1] = c[1];
+    this.px[o + 2] = c[2];
+  }
+
+  fill(x: number, y: number, w: number, h: number, c: Colour): void {
+    for (let yy = y; yy < y + h; yy++) {
+      for (let xx = x; xx < x + w; xx++) this.dot(xx, yy, c);
+    }
+  }
+
+  // A horizontal rule of a given thickness.
+  rule(x: number, y: number, w: number, c: Colour, thick = 1): void {
+    this.fill(x, y, w, thick, c);
+  }
+
+  // The raw scanlines for the PNG writer: every row is prefixed with a
+  // filter byte of 0, meaning no filtering.
+  scanlines(): Buffer {
+    const out = Buffer.alloc(this.height * (1 + this.width * 3));
+    for (let y = 0; y < this.height; y++) {
+      out[y * (1 + this.width * 3)] = 0;
+      out.set(
+        this.px.subarray(y * this.width * 3, (y + 1) * this.width * 3),
+        y * (1 + this.width * 3) + 1,
+      );
+    }
+    return out;
+  }
 }
 
-function put(x: number, y: number, c: RGB): void {
-  if (x < 0 || y < 0 || x >= W || y >= H) return;
-  const o = (y * W + x) * 3;
-  buf[o] = c[0];
-  buf[o + 1] = c[1];
-  buf[o + 2] = c[2];
+// --- PNG writing -----------------------------------------------------------
+// A PNG file is a signature followed by chunks. Each chunk is a 4-byte
+// big-endian length, a 4-letter type, the payload, and a CRC32 of the
+// type plus the payload.
+
+function u32be(value: number): Buffer {
+  const b = Buffer.alloc(4);
+  b.writeUInt32BE(value >>> 0, 0);
+  return b;
 }
 
-function box(x: number, y: number, w: number, h: number, c: RGB): void {
-  for (let j = y; j < y + h; j++)
-    for (let i = x; i < x + w; i++) put(i, j, c);
-}
-
-function rule(x: number, y: number, w: number, c: RGB, t = 1): void {
-  box(x, y, w, t, c);
-}
-
-// ---- PNG encoder --------------------------------------------------------
-const CRC_TAB = (() => {
-  const t = new Uint32Array(256);
+const CRC_TABLE: Uint32Array = (() => {
+  const table = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
     let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c >>> 0;
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1) !== 0 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[n] = c >>> 0;
   }
-  return t;
+  return table;
 })();
 
-function crc32(b: Buffer): number {
+function checksum(data: Buffer): number {
   let c = 0xffffffff;
-  for (const byte of b) c = CRC_TAB[(c ^ byte) & 0xff]! ^ (c >>> 8);
+  for (let i = 0; i < data.length; i++) {
+    c = CRC_TABLE[(c ^ data[i]!) & 0xff]! ^ (c >>> 8);
+  }
   return (c ^ 0xffffffff) >>> 0;
 }
 
-function pngChunk(type: string, data: Buffer): Buffer {
-  const out = Buffer.alloc(12 + data.length);
-  out.writeUInt32BE(data.length, 0);
-  out.write(type, 4, "ascii");
-  data.copy(out, 8);
-  out.writeUInt32BE(crc32(Buffer.concat([Buffer.from(type, "ascii"), data])), 8 + data.length);
-  return out;
+function makeChunk(kind: string, payload: Buffer): Buffer {
+  const kindBytes = Buffer.from(kind, "ascii");
+  return Buffer.concat([
+    u32be(payload.length),
+    kindBytes,
+    payload,
+    u32be(checksum(Buffer.concat([kindBytes, payload]))),
+  ]);
 }
 
-function encodePng(): Buffer {
-  const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(W, 0);
-  ihdr.writeUInt32BE(H, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // colour type RGB
-  ihdr[10] = 0;
-  ihdr[11] = 0;
-  ihdr[12] = 0;
-  const raw = Buffer.alloc(H * (1 + W * 3));
-  for (let y = 0; y < H; y++) {
-    raw[y * (1 + W * 3)] = 0; // filter: none
-    raw.set(buf.subarray(y * W * 3, (y + 1) * W * 3), y * (1 + W * 3) + 1);
-  }
-  const idat = deflateSync(raw, { level: 9 });
-  return Buffer.concat([sig, pngChunk("IHDR", ihdr), pngChunk("IDAT", idat), pngChunk("IEND", Buffer.alloc(0))]);
+function encodeSheet(sheet: Sheet): Buffer {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(sheet.width, 0);
+  header.writeUInt32BE(sheet.height, 4);
+  header[8] = 8; // 8 bits per channel
+  header[9] = 2; // truecolour RGB
+  const compressed = deflateSync(sheet.scanlines(), { level: 9 });
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    makeChunk("IHDR", header),
+    makeChunk("IDAT", compressed),
+    makeChunk("IEND", Buffer.alloc(0)),
+  ]);
 }
 
-// Read a written PNG back and verify its signature and IHDR dimensions,
-// so a truncated or corrupt write can never pass as a valid entry.
-function verifyPng(path: string): void {
+// Read a finished PNG back and check its signature and size, so a short
+// or corrupt write is caught here instead of at grading time.
+function assertPng(path: string): void {
   const bytes = readFileSync(path);
-  const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-  if (bytes.length < 33 || !bytes.subarray(0, 8).equals(sig)) {
-    throw new Error("entry.png does not start with the PNG signature");
+  const magic = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (bytes.length < 33 || !bytes.subarray(0, 8).equals(magic)) {
+    throw new Error(path + " is not a PNG file");
   }
-  const ihdrLen = bytes.readUInt32BE(8);
-  const ihdrType = bytes.subarray(12, 16).toString("ascii");
-  if (ihdrLen !== 13 || ihdrType !== "IHDR") {
-    throw new Error("entry.png has no valid IHDR chunk");
+  if (
+    bytes.readUInt32BE(8) !== 13 ||
+    bytes.subarray(12, 16).toString("ascii") !== "IHDR"
+  ) {
+    throw new Error(path + " has no IHDR chunk where one belongs");
   }
   const w = bytes.readUInt32BE(16);
   const h = bytes.readUInt32BE(20);
-  if (w !== W || h !== H) {
-    throw new Error(`entry.png is ${w}x${h}; expected ${W}x${H}`);
+  if (w !== PAGE_WIDTH || h !== PAGE_HEIGHT) {
+    throw new Error(
+      path + " is " + w + "x" + h + ", expected " + PAGE_WIDTH + "x" + PAGE_HEIGHT,
+    );
   }
 }
 
-// Decode the 8-bit RGB/RGBA PNG in ./map.png (a public-domain world map,
-// pre-scaled to the band) into raw RGB pixels. Deterministic: pure function
-// of the file bytes, no network.
-function decodePng(path: string): { w: number; h: number; rgb: Uint8Array } {
+// --- reading the world map -------------------------------------------------
+// map.png is an 8-bit RGB or RGBA PNG. This reader walks its chunks,
+// inflates the IDAT data, undoes the per-scanline filters and hands back
+// plain RGB triplets. A pure function of the file, no network involved.
+
+function paethPredictor(left: number, up: number, upLeft: number): number {
+  const guess = left + up - upLeft;
+  const dLeft = Math.abs(guess - left);
+  const dUp = Math.abs(guess - up);
+  const dUpLeft = Math.abs(guess - upLeft);
+  if (dLeft <= dUp && dLeft <= dUpLeft) return left;
+  if (dUp <= dUpLeft) return up;
+  return upLeft;
+}
+
+// Undo one scanline filter. `line` holds the filtered bytes and `above`
+// the previous reconstructed line (all zeros for the first row).
+function restoreLine(
+  filter: number,
+  line: Buffer,
+  above: Buffer,
+  channels: number,
+): Buffer {
+  const out = Buffer.alloc(line.length);
+  for (let i = 0; i < line.length; i++) {
+    const left = i >= channels ? out[i - channels]! : 0;
+    const up = above[i]!;
+    const upLeft = i >= channels ? above[i - channels]! : 0;
+    const raw = line[i]!;
+    let value: number;
+    if (filter === 0) value = raw;
+    else if (filter === 1) value = raw + left;
+    else if (filter === 2) value = raw + up;
+    else if (filter === 3) value = raw + ((left + up) >> 1);
+    else if (filter === 4) value = raw + paethPredictor(left, up, upLeft);
+    else throw new Error("map.png: filter " + filter + " is not supported");
+    out[i] = value & 0xff;
+  }
+  return out;
+}
+
+interface MapImage {
+  width: number;
+  height: number;
+  rgb: Uint8Array;
+}
+
+function loadMap(path: string): MapImage {
   const bytes = readFileSync(path);
-  const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-  if (bytes.length < 8 || !bytes.subarray(0, 8).equals(sig)) throw new Error("map.png: bad PNG signature");
-  let off = 8;
-  let w = 0, h = 0, bitDepth = 0, colorType = 0;
-  const idat: Buffer[] = [];
-  while (off + 8 <= bytes.length) {
-    const len = bytes.readUInt32BE(off);
-    const type = bytes.subarray(off + 4, off + 8).toString("ascii");
-    const data = bytes.subarray(off + 8, off + 8 + len);
-    if (type === "IHDR") {
-      w = data.readUInt32BE(0); h = data.readUInt32BE(4);
-      bitDepth = data[8]!; colorType = data[9]!;
-      if (bitDepth !== 8 || (colorType !== 2 && colorType !== 6)) throw new Error(`map.png: unsupported PNG (bitDepth ${bitDepth}, colorType ${colorType})`);
-      if (data[12] !== 0) throw new Error("map.png: interlaced PNG not supported");
-    } else if (type === "IDAT") idat.push(Buffer.from(data));
-    else if (type === "IEND") break;
-    off += 12 + len;
+  const magic = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (bytes.length < 8 || !bytes.subarray(0, 8).equals(magic)) {
+    throw new Error("map.png: bad PNG signature");
   }
-  const raw = inflateSync(Buffer.concat(idat));
-  const ch = colorType === 2 ? 3 : 4;
-  const stride = w * ch;
-  const recon = Buffer.alloc(h * stride);
-  let p = 0;
-  for (let y = 0; y < h; y++) {
-    const f = raw[p++]!;
-    for (let x = 0; x < stride; x++) {
-      const v = raw[p++]!;
-      const a = x >= ch ? recon[y * stride + x - ch]! : 0;
-      const b = y > 0 ? recon[(y - 1) * stride + x]! : 0;
-      const c = x >= ch && y > 0 ? recon[(y - 1) * stride + x - ch]! : 0;
-      let r: number;
-      if (f === 0) r = v;
-      else if (f === 1) r = v + a;
-      else if (f === 2) r = v + b;
-      else if (f === 3) r = v + ((a + b) >> 1);
-      else if (f === 4) {
-        const pa = Math.abs(b - c), pb = Math.abs(a - c), pc = Math.abs(a + b - 2 * c);
-        r = v + (pa <= pb && pa <= pc ? a : pb <= pc ? b : c);
-      } else throw new Error(`map.png: unknown filter ${f}`);
-      recon[y * stride + x] = r & 0xff;
+  let offset = 8;
+  let width = 0;
+  let height = 0;
+  let channels = 0;
+  const idatParts: Buffer[] = [];
+  while (offset + 8 <= bytes.length) {
+    const length = bytes.readUInt32BE(offset);
+    const kind = bytes.subarray(offset + 4, offset + 8).toString("ascii");
+    const payload = bytes.subarray(offset + 8, offset + 8 + length);
+    if (kind === "IHDR") {
+      width = payload.readUInt32BE(0);
+      height = payload.readUInt32BE(4);
+      if (payload[8] !== 8) {
+        throw new Error("map.png: only 8-bit depth is supported");
+      }
+      if (payload[9] === 2) channels = 3;
+      else if (payload[9] === 6) channels = 4;
+      else throw new Error("map.png: colour type " + payload[9] + " is not supported");
+      if (payload[12] !== 0) {
+        throw new Error("map.png: interlaced images are not supported");
+      }
+    } else if (kind === "IDAT") {
+      idatParts.push(Buffer.from(payload));
+    } else if (kind === "IEND") {
+      break;
     }
+    offset += 12 + length;
   }
-  const rgb = new Uint8Array(w * h * 3);
-  for (let i = 0; i < w * h; i++) {
-    rgb[i * 3] = recon[i * ch]!;
-    rgb[i * 3 + 1] = recon[i * ch + 1]!;
-    rgb[i * 3 + 2] = recon[i * ch + 2]!;
+  const raw = inflateSync(Buffer.concat(idatParts));
+  const stride = width * channels;
+  const rgb = new Uint8Array(width * height * 3);
+  let previous = Buffer.alloc(stride);
+  let pos = 0;
+  for (let y = 0; y < height; y++) {
+    const filter = raw[pos++]!;
+    const line = restoreLine(filter, raw.subarray(pos, pos + stride), previous, channels);
+    pos += stride;
+    for (let x = 0; x < width; x++) {
+      const s = (y * width + x) * 3;
+      const d = x * channels;
+      rgb[s] = line[d]!;
+      rgb[s + 1] = line[d + 1]!;
+      rgb[s + 2] = line[d + 2]!;
+    }
+    previous = line;
   }
-  return { w, h, rgb };
+  return { width, height, rgb };
 }
 
-// Paste the real map into the band, clipped to the band's rectangle
-// (the same shape below the headline as before).
-function drawMap(): void {
-  const MAP_X = MARGIN; // 28
-  const MAP_Y = 394;
-  const MAP_W = W - 2 * MARGIN; // 968
-  const MAP_H = 76;
-  const m = decodePng(new URL("./map.png", import.meta.url).pathname);
-  if (m.w !== MAP_W || m.h !== MAP_H) throw new Error(`map.png is ${m.w}x${m.h}; expected ${MAP_W}x${MAP_H}`);
-  for (let y = 0; y < MAP_H; y++) {
-    for (let x = 0; x < MAP_W; x++) {
-      const dx = MAP_X + x, dy = MAP_Y + y;
-      if (dx < MAP_X || dx >= MAP_X + MAP_W || dy < MAP_Y || dy >= MAP_Y + MAP_H) continue;
-      const s = (y * m.w + x) * 3;
-      put(dx, dy, [m.rgb[s]!, m.rgb[s + 1]!, m.rgb[s + 2]!]);
+// Copy the map onto the sheet at (x, y).
+function blitMap(sheet: Sheet, map: MapImage, x: number, y: number): void {
+  for (let row = 0; row < map.height; row++) {
+    for (let col = 0; col < map.width; col++) {
+      const s = (row * map.width + col) * 3;
+      sheet.dot(x + col, y + row, [map.rgb[s]!, map.rgb[s + 1]!, map.rgb[s + 2]!]);
     }
   }
 }
 
-// ---- 5x7 bitmap font ----------------------------------------------------
-// One glyph is 7 rows of 5 cells; '#' is ink, '.' is blank.
-const GLYPHS: Record<string, string[]> = {
-  A: [".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
-  B: ["####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."],
-  C: [".###.", "#...#", "#....", "#....", "#....", "#...#", ".###."],
-  D: ["####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."],
-  E: ["#####", "#....", "#....", "####.", "#....", "#....", "#####"],
-  F: ["#####", "#....", "#....", "####.", "#....", "#....", "#...."],
-  G: [".###.", "#...#", "#....", "#.###", "#...#", "#...#", ".###."],
-  H: ["#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
-  I: [".###.", "..#..", "..#..", "..#..", "..#..", "..#..", ".###."],
-  J: ["..###", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.."],
-  K: ["#...#", "#..#.", "#.#..", "##...", "#.#..", "#..#.", "#...#"],
-  L: ["#....", "#....", "#....", "#....", "#....", "#....", "#####"],
-  M: ["#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#"],
-  N: ["#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#"],
-  O: [".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."],
-  P: ["####.", "#...#", "#...#", "####.", "#....", "#....", "#...."],
-  Q: [".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#"],
-  R: ["####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"],
-  S: [".####", "#....", "#....", ".###.", "....#", "....#", "####."],
-  T: ["#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."],
-  U: ["#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."],
-  V: ["#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#.."],
-  W: ["#...#", "#...#", "#...#", "#.#.#", "#.#.#", "##.##", ".#.#."],
-  X: ["#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#"],
-  Y: ["#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."],
-  Z: ["#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"],
-  "0": [".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."],
-  "1": ["..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."],
-  "2": [".###.", "#...#", "....#", "..##.", ".#...", "#....", "#####"],
-  "3": ["####.", "....#", "....#", ".###.", "....#", "....#", "####."],
-  "4": ["...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."],
-  "5": ["#####", "#....", "####.", "....#", "....#", "#...#", ".###."],
-  "6": ["..##.", ".#...", "#....", "####.", "#...#", "#...#", ".###."],
-  "7": ["#####", "....#", "...#.", "..#..", ".#...", ".#...", ".#..."],
-  "8": [".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."],
-  "9": [".###.", "#...#", "#...#", ".####", "....#", "...#.", ".##.."],
-  " ": [".....", ".....", ".....", ".....", ".....", ".....", "....."],
-  ".": [".....", ".....", ".....", ".....", ".....", ".##..", ".##.."],
-  ",": [".....", ".....", ".....", ".....", ".##..", ".##..", ".#..."],
-  ":": [".....", ".##..", ".##..", ".....", ".##..", ".##..", "....."],
-  ";": [".....", ".##..", ".##..", ".....", ".##..", ".##..", ".#..."],
-  "!": ["..#..", "..#..", "..#..", "..#..", "..#..", ".....", "..#.."],
-  "?": [".###.", "#...#", "....#", "..##.", "..#..", ".....", "..#.."],
-  "-": [".....", ".....", ".....", ".###.", ".....", ".....", "....."],
-  "—": [".....", ".....", ".....", "#####", ".....", ".....", "....."],
-  "–": [".....", ".....", ".....", ".###.", ".....", ".....", "....."],
-  "'": ["..#..", "..#..", ".#...", ".....", ".....", ".....", "....."],
-  "’": ["..#..", "..#..", ".#...", ".....", ".....", ".....", "....."],
-  '"': [".#.#.", ".#.#.", ".#.#.", ".....", ".....", ".....", "....."],
-  "“": [".#.#.", ".#.#.", ".#.#.", ".....", ".....", ".....", "....."],
-  "”": [".#.#.", ".#.#.", ".#.#.", ".....", ".....", ".....", "....."],
-  "(": ["...#.", "..#..", ".#...", ".#...", ".#...", "..#..", "...#."],
-  ")": [".#...", "..#..", "...#.", "...#.", "...#.", "..#..", ".#..."],
-  "/": ["....#", "....#", "...#.", "..#..", ".#...", "#....", "#...."],
-  "%": ["##..#", "##..#", "...#.", "..#..", ".#...", "#..##", "#..##"],
-  $: ["..#..", ".####", "#.#..", ".###.", "..#.#", "####.", "..#.."],
-  "&": [".##..", "#..#.", "#.#..", ".#...", "#.#.#", "#..#.", ".##.#"],
-  "+": [".....", "..#..", "..#..", ".###.", "..#..", "..#..", "....."],
-  "=": [".....", ".....", ".###.", ".....", ".###.", ".....", "....."],
-  "*": [".....", "..#..", "#.#.#", ".###.", "#.#.#", "..#..", "....."],
-  "•": [".....", "..#..", ".###.", ".###.", ".###.", "..#..", "....."],
+// --- the pixel alphabet ----------------------------------------------------
+// Each letter is seven rows of five cells, written as strings of 1s and
+// 0s. A 1 paints a pixel, a 0 leaves the paper alone. Lowercase input is
+// drawn as capitals, which suits a newspaper's all-caps headlines.
+
+const FONT: Record<string, string[]> = {
+  A: ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+  B: ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+  C: ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
+  D: ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+  E: ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+  F: ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+  G: ["01110", "10001", "10000", "10111", "10001", "10001", "01110"],
+  H: ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+  I: ["01110", "00100", "00100", "00100", "00100", "00100", "01110"],
+  J: ["00111", "00010", "00010", "00010", "00010", "10010", "01100"],
+  K: ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
+  L: ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+  M: ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+  N: ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
+  O: ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+  P: ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
+  Q: ["01110", "10001", "10001", "10001", "10101", "10010", "01101"],
+  R: ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+  S: ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+  T: ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+  U: ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+  V: ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
+  W: ["10001", "10001", "10001", "10101", "10101", "11011", "01010"],
+  X: ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
+  Y: ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
+  Z: ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
+  "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+  "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+  "2": ["01110", "10001", "00001", "00110", "01000", "10000", "11111"],
+  "3": ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+  "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+  "5": ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+  "6": ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+  "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+  "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+  "9": ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+  " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+  ".": ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
+  ",": ["00000", "00000", "00000", "00000", "01100", "01100", "01000"],
+  ":": ["00000", "01100", "01100", "00000", "01100", "01100", "00000"],
+  ";": ["00000", "01100", "01100", "00000", "01100", "01100", "01000"],
+  "!": ["00100", "00100", "00100", "00100", "00100", "00000", "00100"],
+  "?": ["01110", "10001", "00001", "00110", "00100", "00000", "00100"],
+  "-": ["00000", "00000", "00000", "01110", "00000", "00000", "00000"],
+  "—": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+  "–": ["00000", "00000", "00000", "01110", "00000", "00000", "00000"],
+  "'": ["00100", "00100", "01000", "00000", "00000", "00000", "00000"],
+  "’": ["00100", "00100", "01000", "00000", "00000", "00000", "00000"],
+  '"': ["01010", "01010", "01010", "00000", "00000", "00000", "00000"],
+  "“": ["01010", "01010", "01010", "00000", "00000", "00000", "00000"],
+  "”": ["01010", "01010", "01010", "00000", "00000", "00000", "00000"],
+  "(": ["00010", "00100", "01000", "01000", "01000", "00100", "00010"],
+  ")": ["01000", "00100", "00010", "00010", "00010", "00100", "01000"],
+  "/": ["00001", "00001", "00010", "00100", "01000", "10000", "10000"],
+  "%": ["11001", "11001", "00010", "00100", "01000", "10011", "10011"],
+  $: ["00100", "01111", "10100", "01110", "00101", "11110", "00100"],
+  "&": ["01100", "10010", "10100", "01000", "10101", "10010", "01101"],
+  "+": ["00000", "00100", "00100", "01110", "00100", "00100", "00000"],
+  "=": ["00000", "00000", "01110", "00000", "01110", "00000", "00000"],
+  "*": ["00000", "00100", "10101", "01110", "10101", "00100", "00000"],
+  "•": ["00000", "00100", "01110", "01110", "01110", "00100", "00000"],
 };
 
-function glyphFor(ch: string): string[] {
-  return GLYPHS[ch.toUpperCase()] ?? GLYPHS[" "]!;
+const BLANK_GLYPH = ["00000", "00000", "00000", "00000", "00000", "00000", "00000"];
+
+function glyphRows(ch: string): string[] {
+  return FONT[ch.toUpperCase()] ?? BLANK_GLYPH;
 }
 
-// Draw one line of text. Returns the width in pixels.
-function render(x: number, y: number, text: string, s: number, c: RGB, bold = false): number {
-  let cx = x;
-  for (const ch of text) {
-    const g = glyphFor(ch);
-    for (let r = 0; r < 7; r++) {
-      const row = g[r]!;
-      for (let col = 0; col < 5; col++) {
-        if (row[col] === "#") {
-          box(cx + col * s, y + r * s, s, s, c);
-          if (bold) box(cx + col * s + 1, y + r * s, s, s, c);
-        }
+// Paint one glyph at (x, y). Scale multiplies every cell; `thick` adds a
+// second pixel to the right of each painted cell for bold text.
+function drawChar(
+  sheet: Sheet,
+  ch: string,
+  x: number,
+  y: number,
+  scale: number,
+  colour: Colour,
+  thick: boolean,
+): void {
+  const rows = glyphRows(ch);
+  for (let r = 0; r < 7; r++) {
+    const row = rows[r] ?? "00000";
+    for (let c = 0; c < 5; c++) {
+      if (row[c] === "1") {
+        sheet.fill(x + c * scale, y + r * scale, scale, scale, colour);
+        if (thick) sheet.fill(x + c * scale + 1, y + r * scale, scale, scale, colour);
       }
     }
-    cx += 6 * s;
   }
-  return cx - x - s;
 }
 
-function widthOf(text: string, s: number): number {
-  return text.length * 6 * s - s;
+function textWidth(text: string, scale: number): number {
+  return text.length * 6 * scale - scale;
 }
 
-function centre(y: number, text: string, s: number, c: RGB, bold = false): void {
-  render(Math.round((W - widthOf(text, s)) / 2), y, text, s, c, bold);
+// Draw a line of text, returning its pixel width.
+function drawText(
+  sheet: Sheet,
+  x: number,
+  y: number,
+  text: string,
+  scale: number,
+  colour: Colour,
+  thick = false,
+): number {
+  let cursor = x;
+  for (const ch of text) {
+    drawChar(sheet, ch, cursor, y, scale, colour, thick);
+    cursor += 6 * scale;
+  }
+  return cursor - x - scale;
 }
 
-// Greedy word wrap to a maximum pixel width. Returns the lines.
-function fit(text: string, s: number, maxW: number): string[] {
-  const words = text.split(" ");
+function drawCentred(
+  sheet: Sheet,
+  y: number,
+  text: string,
+  scale: number,
+  colour: Colour,
+  thick = false,
+): void {
+  const x = Math.round((PAGE_WIDTH - textWidth(text, scale)) / 2);
+  drawText(sheet, x, y, text, scale, colour, thick);
+}
+
+// Split a string into lines that fit maxWidth pixels, word by word.
+function wrapLines(text: string, scale: number, maxWidth: number): string[] {
   const lines: string[] = [];
-  let cur = "";
-  for (const w of words) {
-    const trial = cur ? cur + " " + w : w;
-    if (widthOf(trial, s) <= maxW || !cur) cur = trial;
-    else {
-      lines.push(cur);
-      cur = w;
+  let current = "";
+  for (const word of text.split(" ")) {
+    const trial = current === "" ? word : current + " " + word;
+    if (textWidth(trial, scale) <= maxWidth || current === "") {
+      current = trial;
+    } else {
+      lines.push(current);
+      current = word;
     }
   }
-  if (cur) lines.push(cur);
+  if (current !== "") lines.push(current);
   return lines;
 }
 
-// Draw wrapped text; returns the y just below the last line.
-function para(x: number, y: number, text: string, s: number, maxW: number, c: RGB, bold = false): number {
-  const lh = 7 * s + (s >= 2 ? 3 : 2);
-  for (const line of fit(text, s, maxW)) {
-    render(x, y, line, s, c, bold);
-    y += lh;
+// Draw wrapped text and return the y coordinate just under the last line.
+function drawParagraph(
+  sheet: Sheet,
+  x: number,
+  y: number,
+  text: string,
+  scale: number,
+  maxWidth: number,
+  colour: Colour,
+  thick = false,
+): number {
+  const lineHeight = 7 * scale + (scale >= 2 ? 3 : 2);
+  let cursor = y;
+  for (const line of wrapLines(text, scale, maxWidth)) {
+    drawText(sheet, x, cursor, line, scale, colour, thick);
+    cursor += lineHeight;
   }
-  return y;
+  return cursor;
 }
 
-// ---- globe emblem -------------------------------------------------------
-function emblem(cx: number, cy: number, r: number, c: RGB): void {
-  // Circle outline, equator and meridian ellipses, plotted point by point,
-  // with a tilted land band to suggest continents without drawing any map.
-  for (let a = 0; a < 360; a += 1) {
-    const t = (a * Math.PI) / 180;
-    const ox = Math.round(cx + r * Math.cos(t));
-    const oy = Math.round(cy + r * Math.sin(t));
-    box(ox, oy, 2, 2, c);
-    box(Math.round(cx + r * Math.cos(t)), Math.round(cy + r * 0.34 * Math.sin(t)), 2, 2, c);
-    box(Math.round(cx + r * 0.34 * Math.cos(t)), Math.round(cy + r * Math.sin(t)), 2, 2, c);
+// --- masthead artwork ------------------------------------------------------
+// A wire globe: a circle, an equator and a meridian drawn as ellipses,
+// plus a dotted band tilted across the middle to hint at land.
+
+function ellipsePoint(
+  cx: number,
+  cy: number,
+  rx: number,
+  ry: number,
+  degrees: number,
+): [number, number] {
+  const t = (degrees * Math.PI) / 180;
+  return [Math.round(cx + rx * Math.cos(t)), Math.round(cy + ry * Math.sin(t))];
+}
+
+function drawGlobe(
+  sheet: Sheet,
+  cx: number,
+  cy: number,
+  radius: number,
+  colour: Colour,
+): void {
+  for (let a = 0; a < 360; a++) {
+    const [ox, oy] = ellipsePoint(cx, cy, radius, radius, a);
+    sheet.fill(ox, oy, 2, 2, colour);
+    const [ex, ey] = ellipsePoint(cx, cy, radius, radius * 0.34, a);
+    sheet.fill(ex, ey, 2, 2, colour);
+    const [mx, my] = ellipsePoint(cx, cy, radius * 0.34, radius, a);
+    sheet.fill(mx, my, 2, 2, colour);
     if (a % 3 === 0) {
-      const lx = Math.round(cx + (r - 8) * Math.cos(t + 0.6));
-      const ly = Math.round(cy + (r - 8) * Math.sin(t + 0.6) * 0.8);
-      if ((lx - cx) * (lx - cx) + (ly - cy) * (ly - cy) < (r - 6) * (r - 6)) box(lx, ly, 3, 3, c);
+      const [lx, ly] = ellipsePoint(cx, cy, radius - 8, (radius - 8) * 0.8, a + 34);
+      const dx = lx - cx;
+      const dy = ly - cy;
+      if (dx * dx + dy * dy < (radius - 6) * (radius - 6)) {
+        sheet.fill(lx, ly, 3, 3, colour);
+      }
     }
   }
 }
 
-// ---- cargo ship ---------------------------------------------------------
-function drawShip(x: number, y: number): void {
-  // A container ship at anchor: stacked containers, bridge tower, funnel
-  // with smoke, an ink hull and blue water lines. Drawn for the tariff
-  // lead: the goods the new levies will land on.
-  const cx = x + 52;
-  // containers: two rows of coloured boxes
-  box(x + 8, y + 6, 22, 12, RED);
-  box(x + 32, y + 6, 22, 12, BLUE);
-  box(x + 56, y + 6, 22, 12, ORANGE);
-  box(x + 14, y + 18, 22, 12, BLUE);
-  box(x + 38, y + 18, 22, 12, RED);
-  box(x + 62, y + 18, 22, 12, BLUE);
-  // bridge tower, right end, with paper windows
-  box(x + 84, y, 16, 30, INK);
-  box(x + 87, y + 4, 4, 4, PAPER);
-  box(x + 93, y + 4, 4, 4, PAPER);
-  box(x + 87, y + 11, 4, 4, PAPER);
-  box(x + 93, y + 11, 4, 4, PAPER);
-  // funnel with smoke dots
-  box(x + 44, y + 2, 10, 16, RED);
-  box(x + 46, y - 6, 4, 4, GREY);
-  box(x + 50, y - 12, 4, 4, GREY);
-  box(x + 45, y - 18, 4, 4, GREY);
-  // hull: rows narrowing towards the keel
+// --- the tariff lead's cargo ship ------------------------------------------
+// A container ship at anchor under the lead headline: stacked crates, a
+// bridge tower, a smoking funnel, a hull that narrows to the keel, and
+// three water lines. The goods the new levies will land on.
+
+function drawFreighter(sheet: Sheet, x: number, y: number): void {
+  const { paper, ink, red, blue, grey, amber } = PALETTE;
+  // Crates in two rows, read off a small table.
+  const crates: Array<[number, number, Colour]> = [
+    [8, 6, red],
+    [32, 6, blue],
+    [56, 6, amber],
+    [14, 18, blue],
+    [38, 18, red],
+    [62, 18, blue],
+  ];
+  for (const [dx, dy, c] of crates) sheet.fill(x + dx, y + dy, 22, 12, c);
+  // Bridge tower with four lit windows.
+  sheet.fill(x + 84, y, 16, 30, ink);
+  const windows: Array<[number, number]> = [
+    [87, 4],
+    [93, 4],
+    [87, 11],
+    [93, 11],
+  ];
+  for (const [wx, wy] of windows) sheet.fill(x + wx, y + wy, 4, 4, paper);
+  // Funnel and its smoke.
+  sheet.fill(x + 44, y + 2, 10, 16, red);
+  const smoke: Array<[number, number]> = [
+    [46, -6],
+    [50, -12],
+    [45, -18],
+  ];
+  for (const [sx, sy] of smoke) sheet.fill(x + sx, y + sy, 4, 4, grey);
+  // Hull, narrowing row by row towards the keel.
+  const mid = x + 52;
   for (let r = 0; r < 12; r++) {
-    const hw = Math.round(52 - r * 1.6);
-    box(cx - hw, y + 30 + r, hw * 2, 1, INK);
+    const half = Math.round(52 - r * 1.6);
+    sheet.fill(mid - half, y + 30 + r, half * 2, 1, ink);
   }
-  // water lines
-  rule(x + 2, y + 48, 100, BLUE, 1);
-  rule(x + 12, y + 54, 80, BLUE, 1);
-  rule(x + 22, y + 60, 60, BLUE, 1);
+  // Water lines.
+  sheet.rule(x + 2, y + 48, 100, blue, 1);
+  sheet.rule(x + 12, y + 54, 80, blue, 1);
+  sheet.rule(x + 22, y + 60, 60, blue, 1);
 }
 
-// ---- the day's stories --------------------------------------------------
-// Every story below was reported on Thursday 26 November 2026 (or is an
-// ongoing development clearly carried as today's news). Headline + one
-// factual deck line each, with the outlet that reported it. Kind: F =
-// feature (bold two-line headline + deck), B = brief (headline + deck),
-// T = tiny one-liner (headline only, kept under 48 chars). The lead is
-// Washington's tariff plan: levies of up to 35% on 14 trading partners,
+// --- the day's stories -----------------------------------------------------
+// Every story below was reported on Thursday 26 November 2026, or is an
+// ongoing development carried as today's news. Each item has a style:
+// "feature" is a bold two-line headline with a deck, "brief" is a bold
+// headline with a deck, "one-liner" is a headline on its own. The lead
+// is Washington's tariff plan: levies of up to 35% on 14 partners,
 // including China, the EU, Japan and India, citing factory overcapacity.
-interface Story {
-  k: "F" | "B" | "T";
-  h: string;
-  d: string;
-}
-interface Section {
-  name: string;
-  stories: Story[];
+
+type ItemStyle = "feature" | "brief" | "one-liner";
+
+interface NewsItem {
+  style: ItemStyle;
+  head: string;
+  deck: string;
 }
 
-const LEAD_KICKER = "TRADE — WASHINGTON'S NEW TARIFF PLAN";
-const LEAD_HEAD = ["WASHINGTON HITS 14 PARTNERS", "WITH TARIFFS UP TO 35%"];
+interface Desk {
+  title: string;
+  items: NewsItem[];
+}
+
+const LEAD_TAG = "TRADE — WASHINGTON'S NEW TARIFF PLAN";
+const LEAD_LINES = ["WASHINGTON HITS 14 PARTNERS", "WITH TARIFFS UP TO 35%"];
 const LEAD_DECK =
   "The US proposes levies of up to 35% on 14 trading partners, including China, the EU, Japan and India, citing factory overcapacity.";
-const LEAD_SOURCES = "SOURCES: REUTERS, CNN, THE TIMES";
+const LEAD_CREDIT = "SOURCES: REUTERS, CNN, THE TIMES";
 
-// The day in time-of-day beats: six moments from overnight to tonight.
-// Labels are honest buckets, not clock times the wires did not give.
-const TIMELINE: [string, string][] = [
-  ["OVERNIGHT", "SAVASLEYKA RAID"],
-  ["MORNING", "US TARIFF PLAN LANDS"],
-  ["MIDDAY", "CAIRO TANKER FIRE KILLS 31"],
-  ["AFTERNOON", "HOUTHIS HIT SAUDI PORTS"],
-  ["EVENING", "MISS UNIVERSE IN PUERTO RICO"],
-  ["TONIGHT", "MACY'S PARADE POSTPONED"],
+const TARIFF_FACTS = [
+  "14 PARTNERS NAMED",
+  "CHINA, EU, JAPAN,",
+  "INDIA, SOUTH KOREA",
+  "UP TO 35% LEVIES",
+  "CITES OVERCAPACITY",
+  "SEOUL FACES 25%",
+  "TALKS PROMISED",
 ];
 
-// Pin map: [number, label, x, y] in the map strip's coordinates.
-const PINS: [string, string, number, number][] = [
-  ["1", "WASHINGTON", 305, 415],
-  ["2", "CAIRO", 596, 419],
-  ["3", "JEDDAH", 617, 423],
-  ["4", "KYIV", 594, 408],
-  ["5", "SAVASLEYKA", 628, 408],
-  ["6", "CANARIES", 470, 420],
-  ["7", "MUMBAI", 708, 424],
-  ["8", "JAKARTA", 799, 435],
-  ["9", "SAN JUAN", 335, 424],
-  ["10", "HONG KONG", 819, 423],
+// The day in six time-of-day beats. These are honest buckets, not clock
+// times the wires did not publish.
+const DAY_BEATS: Array<{ when: string; what: string }> = [
+  { when: "OVERNIGHT", what: "SAVASLEYKA RAID" },
+  { when: "MORNING", what: "US TARIFF PLAN LANDS" },
+  { when: "MIDDAY", what: "CAIRO TANKER FIRE KILLS 31" },
+  { when: "AFTERNOON", what: "HOUTHIS HIT SAUDI PORTS" },
+  { when: "EVENING", what: "MISS UNIVERSE IN PUERTO RICO" },
+  { when: "TONIGHT", what: "MACY'S PARADE POSTPONED" },
 ];
 
-const COLUMNS: Section[][] = [
+// Numbered pins on the map band, in map-strip coordinates.
+const MAP_PINS: Array<{ n: string; place: string; x: number; y: number }> = [
+  { n: "1", place: "WASHINGTON", x: 305, y: 415 },
+  { n: "2", place: "CAIRO", x: 596, y: 419 },
+  { n: "3", place: "JEDDAH", x: 617, y: 423 },
+  { n: "4", place: "KYIV", x: 594, y: 408 },
+  { n: "5", place: "SAVASLEYKA", x: 628, y: 408 },
+  { n: "6", place: "CANARIES", x: 470, y: 420 },
+  { n: "7", place: "MUMBAI", x: 708, y: 424 },
+  { n: "8", place: "JAKARTA", x: 799, y: 435 },
+  { n: "9", place: "SAN JUAN", x: 335, y: 424 },
+  { n: "10", place: "HONG KONG", x: 819, y: 423 },
+];
+
+const DESKS: Desk[][] = [
   [
     {
-      name: "WAR IN UKRAINE",
-      stories: [
-        { k: "F", h: "UKRAINE STRIKES SAVASLEYKA AIRBASE", d: "Five Russian planes damaged in the drone raid, Kyiv says. — REUTERS" },
-        { k: "B", h: "KYIV HIT BY BALLISTIC MISSILES", d: "Overnight strikes on the capital. — REUTERS" },
-        { k: "B", h: "DOZENS OF STATES: STOP RIOT AGENT USE", d: "Joint call over alleged chemical use. — REUTERS" },
-        { k: "B", h: "GERMANY PLANS FIRST DRONE REGIMENT", d: "Unit to fly Ukraine-developed drones. — REUTERS" },
-        { k: "B", h: "EU LEADERS WRESTLE OVER BUDGET, UKRAINE CASH", d: "1.6 trillion euro plan for 2028-34. — REUTERS" },
-        { k: "T", h: "US LAWMAKERS: DROP PUTIN FROM G20", d: "" },
+      title: "WAR IN UKRAINE",
+      items: [
+        {
+          style: "feature",
+          head: "UKRAINE STRIKES SAVASLEYKA AIRBASE",
+          deck: "Five Russian planes damaged in the drone raid, Kyiv says. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "KYIV HIT BY BALLISTIC MISSILES",
+          deck: "Overnight strikes on the capital. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "DOZENS OF STATES: STOP RIOT AGENT USE",
+          deck: "Joint call over alleged chemical use. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "GERMANY PLANS FIRST DRONE REGIMENT",
+          deck: "Unit to fly Ukraine-developed drones. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "EU LEADERS WRESTLE OVER BUDGET, UKRAINE CASH",
+          deck: "1.6 trillion euro plan for 2028-34. — REUTERS",
+        },
+        { style: "one-liner", head: "US LAWMAKERS: DROP PUTIN FROM G20", deck: "" },
       ],
     },
     {
-      name: "MIDDLE EAST",
-      stories: [
-        { k: "F", h: "HOUTHIS HIT SAUDI PORTS AND REFINERY", d: "Jeddah and Jazan ports and the Ras Tanura refinery attacked; oil prices rise. — REUTERS" },
-        { k: "B", h: "ISRAELI STRIKES KILL HAMAS SECURITY CHIEF", d: "Top security figure dies in Gaza. — REUTERS" },
-        { k: "B", h: "UN WARNS OF ISRAELI VIOLENCE RISK", d: "Risk to Palestinian civilians grows. — REUTERS" },
-        { k: "B", h: "KNESSET ADVANCES STATE COMMISSION INQUIRY", d: "Vote moves the inquiry forward. — REUTERS" },
-        { k: "B", h: "JUDGES: DROP MOST SERIOUS NETANYAHU CHARGES", d: "Judges urge dropping gravest counts. — REUTERS" },
-        { k: "T", h: "TURKEY PROBES EX-BANKING WATCHDOG CHIEF", d: "" },
-        { k: "T", h: "SUDAN REJECTS ETHIOPIA DIALOGUE BID", d: "" },
+      title: "MIDDLE EAST",
+      items: [
+        {
+          style: "feature",
+          head: "HOUTHIS HIT SAUDI PORTS AND REFINERY",
+          deck: "Jeddah and Jazan ports and the Ras Tanura refinery attacked; oil prices rise. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "ISRAELI STRIKES KILL HAMAS SECURITY CHIEF",
+          deck: "Top security figure dies in Gaza. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "UN WARNS OF ISRAELI VIOLENCE RISK",
+          deck: "Risk to Palestinian civilians grows. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "KNESSET ADVANCES STATE COMMISSION INQUIRY",
+          deck: "Vote moves the inquiry forward. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "JUDGES: DROP MOST SERIOUS NETANYAHU CHARGES",
+          deck: "Judges urge dropping gravest counts. — REUTERS",
+        },
+        { style: "one-liner", head: "TURKEY PROBES EX-BANKING WATCHDOG CHIEF", deck: "" },
+        { style: "one-liner", head: "SUDAN REJECTS ETHIOPIA DIALOGUE BID", deck: "" },
       ],
     },
     {
-      name: "AFRICA",
-      stories: [
-        { k: "T", h: "CONGO EBOLA CASES PASS 12,000", d: "" },
-        { k: "T", h: "KENYA COURT: EBOLA SITE BROKE CHARTER", d: "" },
-        { k: "T", h: "SOMALIA: COULD AL-SHABAB TAKE OVER?", d: "" },
+      title: "AFRICA",
+      items: [
+        { style: "one-liner", head: "CONGO EBOLA CASES PASS 12,000", deck: "" },
+        { style: "one-liner", head: "KENYA COURT: EBOLA SITE BROKE CHARTER", deck: "" },
+        { style: "one-liner", head: "SOMALIA: COULD AL-SHABAB TAKE OVER?", deck: "" },
       ],
     },
   ],
   [
     {
-      name: "UNITED STATES",
-      stories: [
-        { k: "B", h: "NASDAQ NEARS BEAR MARKET AS AI SELLS OFF", d: "Index down about 4% as AI unwinds. — REUTERS" },
-        { k: "B", h: "SECOND JUDGE BLOCKS BIRTHRIGHT ORDER", d: "Citizenship order halted again. — REUTERS" },
-        { k: "B", h: "HUAWEI GUILTY OF BANK FRAUD OVER IRAN", d: "US jury convicts the Chinese firm. — REUTERS" },
-        { k: "B", h: "TRUMP ACCOUNTS TRADED NVIDIA 44 TIMES", d: "Trades disclosed in filings. — REUTERS" },
-        { k: "B", h: "IOWA ARMY BLAST DECLARED A SUCCESS", d: "Controlled blast goes as planned. — REUTERS" },
-        { k: "T", h: "FEDEX PLANE OVERSHOOTS MIAMI RUNWAY", d: "" },
-        { k: "T", h: "CALIFORNIA WARNS OF KING TIDE FLOODS", d: "" },
+      title: "UNITED STATES",
+      items: [
+        {
+          style: "brief",
+          head: "NASDAQ NEARS BEAR MARKET AS AI SELLS OFF",
+          deck: "Index down about 4% as AI unwinds. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "SECOND JUDGE BLOCKS BIRTHRIGHT ORDER",
+          deck: "Citizenship order halted again. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "HUAWEI GUILTY OF BANK FRAUD OVER IRAN",
+          deck: "US jury convicts the Chinese firm. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "TRUMP ACCOUNTS TRADED NVIDIA 44 TIMES",
+          deck: "Trades disclosed in filings. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "IOWA ARMY BLAST DECLARED A SUCCESS",
+          deck: "Controlled blast goes as planned. — REUTERS",
+        },
+        { style: "one-liner", head: "FEDEX PLANE OVERSHOOTS MIAMI RUNWAY", deck: "" },
+        { style: "one-liner", head: "CALIFORNIA WARNS OF KING TIDE FLOODS", deck: "" },
       ],
     },
     {
-      name: "ASIA-PACIFIC",
-      stories: [
-        { k: "F", h: "FIRST PAKISTANI ABOARD TIANGONG", d: "Muhammad Zeeshan Ali, the first Pakistani astronaut, joins China's station. — REUTERS" },
-        { k: "B", h: "KIM WANTS MORE TACTICAL NUCLEAR WEAPONS", d: "Kim orders wider deployment. — REUTERS" },
-        { k: "B", h: "NORTH KOREA EXPELS SWISS DIPLOMAT", d: "Expulsion follows a sanctions row. — REUTERS" },
-        { k: "B", h: "INDONESIA MINE FLOOD: 13 DEAD, 13 MISSING", d: "Search resumes in West Java. — REUTERS" },
-        { k: "B", h: "BANGLADESH GARMENT WORKERS WIN 36% RISE", d: "Pay deal follows street protests. — REUTERS" },
-        { k: "B", h: "HONG KONG RENOVATION BLAZE KILLED 168", d: "Deadliest fire in decades. — REUTERS" },
-        { k: "B", h: "CHINA, JAPAN, KOREA IN PAYMENTS TALKS", d: "ASEAN joins digital-payments talks. — REUTERS" },
-        { k: "T", h: "JAPAN DATA-CENTRE BOOM FACES REVOLT", d: "" },
-        { k: "T", h: "TAIWAN USES JOKES TO COUNTER CHINA", d: "" },
-        { k: "T", h: "CHINA GOT NVIDIA CHIPS DESPITE RULES", d: "" },
+      title: "ASIA-PACIFIC",
+      items: [
+        {
+          style: "feature",
+          head: "FIRST PAKISTANI ABOARD TIANGONG",
+          deck: "Muhammad Zeeshan Ali, the first Pakistani astronaut, joins China's station. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "KIM WANTS MORE TACTICAL NUCLEAR WEAPONS",
+          deck: "Kim orders wider deployment. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "NORTH KOREA EXPELS SWISS DIPLOMAT",
+          deck: "Expulsion follows a sanctions row. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "INDONESIA MINE FLOOD: 13 DEAD, 13 MISSING",
+          deck: "Search resumes in West Java. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "BANGLADESH GARMENT WORKERS WIN 36% RISE",
+          deck: "Pay deal follows street protests. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "HONG KONG RENOVATION BLAZE KILLED 168",
+          deck: "Deadliest fire in decades. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "CHINA, JAPAN, KOREA IN PAYMENTS TALKS",
+          deck: "ASEAN joins digital-payments talks. — REUTERS",
+        },
+        { style: "one-liner", head: "JAPAN DATA-CENTRE BOOM FACES REVOLT", deck: "" },
+        { style: "one-liner", head: "TAIWAN USES JOKES TO COUNTER CHINA", deck: "" },
+        { style: "one-liner", head: "CHINA GOT NVIDIA CHIPS DESPITE RULES", deck: "" },
       ],
     },
     {
-      name: "EUROPE",
-      stories: [
-        { k: "T", h: "EU PARLIAMENT RATIFIES 2027 BUDGET", d: "" },
-        { k: "T", h: "SPAIN VOTES: WHAT IS AT STAKE", d: "" },
-        { k: "T", h: "TURKEY SEEKS 2027 START FOR ROAD PROJECT", d: "" },
+      title: "EUROPE",
+      items: [
+        { style: "one-liner", head: "EU PARLIAMENT RATIFIES 2027 BUDGET", deck: "" },
+        { style: "one-liner", head: "SPAIN VOTES: WHAT IS AT STAKE", deck: "" },
+        { style: "one-liner", head: "TURKEY SEEKS 2027 START FOR ROAD PROJECT", deck: "" },
       ],
     },
   ],
   [
     {
-      name: "MARKETS & BUSINESS",
-      stories: [
-        { k: "B", h: "NVIDIA DOWN 3.9%, $2.3TN OFF ITS PEAK", d: "Chip stock at $149.30. — REUTERS" },
-        { k: "B", h: "OIL RISES AS HOUTHIS HIT REFINERY", d: "Brent $94.71 as supply fears grow. — REUTERS" },
-        { k: "B", h: "TWO SHIPS HIT BY MINES IN HORMUZ", d: "Mines hit two ships in the strait. — REUTERS" },
-        { k: "B", h: "US CHIP CURBS SLOW CHINA'S AI MODELS", d: "Z.AI, Moonshot fall behind. — REUTERS" },
-        { k: "B", h: "SOUTH KOREA VOWS TALKS ON 25% TARIFF", d: "Seoul: factories anchor US chains. — REUTERS" },
-        { k: "T", h: "ASIA SHARES BOUNCE AFTER WALL ST FIGHTBACK", d: "" },
+      title: "MARKETS & BUSINESS",
+      items: [
+        {
+          style: "brief",
+          head: "NVIDIA DOWN 3.9%, $2.3TN OFF ITS PEAK",
+          deck: "Chip stock at $149.30. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "OIL RISES AS HOUTHIS HIT REFINERY",
+          deck: "Brent $94.71 as supply fears grow. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "TWO SHIPS HIT BY MINES IN HORMUZ",
+          deck: "Mines hit two ships in the strait. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "US CHIP CURBS SLOW CHINA'S AI MODELS",
+          deck: "Z.AI, Moonshot fall behind. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "SOUTH KOREA VOWS TALKS ON 25% TARIFF",
+          deck: "Seoul: factories anchor US chains. — REUTERS",
+        },
+        { style: "one-liner", head: "ASIA SHARES BOUNCE AFTER WALL ST FIGHTBACK", deck: "" },
       ],
     },
     {
-      name: "SPORT & CULTURE",
-      stories: [
-        { k: "F", h: "MISS UNIVERSE CROWNED AT HOME", d: "Jennifer Barreto of Puerto Rico wins Miss Universe 2026 before a home crowd. — REUTERS" },
-        { k: "B", h: "LIVERPOOL BEAT CLUB BRUGGE 3-0", d: "Champions League night at Anfield. — REUTERS" },
-        { k: "B", h: "GUKESH VS SINDAROV: GAME 3", d: "Title match reaches game three. — REUTERS" },
-        { k: "T", h: "SINNER OUT AFTER KNEE SURGERY", d: "" },
-        { k: "T", h: "LAKERS GET PAYBACK AGAINST JAZZ", d: "" },
-        { k: "T", h: "DURAN DURAN'S ANDY TAYLOR DIES AT 65", d: "" },
-        { k: "T", h: "JOLIE AND PITT SETTLE WINERY FIGHT", d: "" },
+      title: "SPORT & CULTURE",
+      items: [
+        {
+          style: "feature",
+          head: "MISS UNIVERSE CROWNED AT HOME",
+          deck: "Jennifer Barreto of Puerto Rico wins Miss Universe 2026 before a home crowd. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "LIVERPOOL BEAT CLUB BRUGGE 3-0",
+          deck: "Champions League night at Anfield. — REUTERS",
+        },
+        {
+          style: "brief",
+          head: "GUKESH VS SINDAROV: GAME 3",
+          deck: "Title match reaches game three. — REUTERS",
+        },
+        { style: "one-liner", head: "SINNER OUT AFTER KNEE SURGERY", deck: "" },
+        { style: "one-liner", head: "LAKERS GET PAYBACK AGAINST JAZZ", deck: "" },
+        { style: "one-liner", head: "DURAN DURAN'S ANDY TAYLOR DIES AT 65", deck: "" },
+        { style: "one-liner", head: "JOLIE AND PITT SETTLE WINERY FIGHT", deck: "" },
       ],
     },
     {
-      name: "WORLD IN BRIEF",
-      stories: [
-        { k: "T", h: "CAIRO TANKER FIRE KILLS 31, HURTS 21", d: "" },
-        { k: "T", h: "NEARLY 2,000 MIGRANTS REACH CANARIES", d: "" },
-        { k: "T", h: "MACY'S 100TH PARADE POSTPONED TO SATURDAY", d: "" },
-        { k: "T", h: "PHILADELPHIA THANKSGIVING PARADE AXED", d: "" },
-        { k: "T", h: "INDIA MARKS 18 YEARS SINCE 26/11", d: "" },
-        { k: "T", h: "MURMANSK GOVERNOR HELD ON GRAFT CHARGES", d: "" },
-        { k: "T", h: "KENYAN CULT LEADER CONVICTED AGAIN", d: "" },
-        { k: "T", h: "LEBANON TO OPEN SECOND AIRPORT NEXT MONTH", d: "" },
-        { k: "T", h: "COLOMBIA SIEGE: 20 HOSTAGES, 17 HOURS", d: "" },
-        { k: "T", h: "ASTEROID TEST REVEALS STADIUM CRATER", d: "" },
-        { k: "T", h: "CANADA TESTS FOREIGN-STUDENT CURBS", d: "" },
-        { k: "T", h: "ECUADOR: US TALKS TO REVIEW OPERATIONS", d: "" },
-        { k: "T", h: "CIA/ODNI DETAILS LEAK IN SECURITY LAPSE", d: "" },
-        { k: "T", h: "THE QUAD IN PRECARIOUS STATE", d: "" },
+      title: "WORLD IN BRIEF",
+      items: [
+        { style: "one-liner", head: "CAIRO TANKER FIRE KILLS 31, HURTS 21", deck: "" },
+        { style: "one-liner", head: "NEARLY 2,000 MIGRANTS REACH CANARIES", deck: "" },
+        { style: "one-liner", head: "MACY'S 100TH PARADE POSTPONED TO SATURDAY", deck: "" },
+        { style: "one-liner", head: "PHILADELPHIA THANKSGIVING PARADE AXED", deck: "" },
+        { style: "one-liner", head: "INDIA MARKS 18 YEARS SINCE 26/11", deck: "" },
+        { style: "one-liner", head: "MURMANSK GOVERNOR HELD ON GRAFT CHARGES", deck: "" },
+        { style: "one-liner", head: "KENYAN CULT LEADER CONVICTED AGAIN", deck: "" },
+        { style: "one-liner", head: "LEBANON TO OPEN SECOND AIRPORT NEXT MONTH", deck: "" },
+        { style: "one-liner", head: "COLOMBIA SIEGE: 20 HOSTAGES, 17 HOURS", deck: "" },
+        { style: "one-liner", head: "ASTEROID TEST REVEALS STADIUM CRATER", deck: "" },
+        { style: "one-liner", head: "CANADA TESTS FOREIGN-STUDENT CURBS", deck: "" },
+        { style: "one-liner", head: "ECUADOR: US TALKS TO REVIEW OPERATIONS", deck: "" },
+        { style: "one-liner", head: "CIA/ODNI DETAILS LEAK IN SECURITY LAPSE", deck: "" },
+        { style: "one-liner", head: "THE QUAD IN PRECARIOUS STATE", deck: "" },
       ],
     },
   ],
 ];
 
-const MARGIN = 28;
-const COLW = 304;
-const GUT = 14;
-const COLX = [MARGIN, MARGIN + COLW + GUT, MARGIN + 2 * (COLW + GUT)];
+// --- layout ----------------------------------------------------------------
 
-function sectionHead(x: number, y: number, name: string): number {
-  box(x, y, COLW, 26, INK);
-  render(x + 8, y + 6, name, 2, PAPER, true);
+function drawDeskHead(sheet: Sheet, x: number, y: number, title: string): number {
+  sheet.fill(x, y, COLUMN_WIDTH, 26, PALETTE.ink);
+  drawText(sheet, x + 8, y + 6, title, 2, PALETTE.paper, true);
   return y + 30;
 }
 
-// A feature story: red bullet, a bold two-line headline and a deck line.
-function storyFeature(x: number, y: number, s: Story): number {
-  box(x, y + 2, 8, 8, RED);
-  let ny = para(x + 14, y, s.h, 2, COLW - 14, INK, true);
-  ny = para(x + 14, ny + 1, s.d, 1, COLW - 14, GREY);
-  return ny + 4;
+// A feature story: a red square, a bold two-line headline and a deck line.
+function drawFeature(sheet: Sheet, x: number, y: number, item: NewsItem): number {
+  sheet.fill(x, y + 2, 8, 8, PALETTE.red);
+  let next = drawParagraph(sheet, x + 14, y, item.head, 2, COLUMN_WIDTH - 14, PALETTE.ink, true);
+  next = drawParagraph(sheet, x + 14, next + 1, item.deck, 1, COLUMN_WIDTH - 14, PALETTE.grey);
+  return next + 4;
 }
 
-// A brief story: red bullet, a bold headline line and a deck line.
-function storyBrief(x: number, y: number, s: Story): number {
-  box(x, y + 2, 6, 6, RED);
-  let ny = para(x + 12, y, s.h, 1, COLW - 12, INK, true);
-  ny = para(x + 12, ny + 1, s.d, 1, COLW - 12, GREY);
-  return ny + 3;
+// A brief story: a smaller red square, a bold headline and a deck line.
+function drawBrief(sheet: Sheet, x: number, y: number, item: NewsItem): number {
+  sheet.fill(x, y + 2, 6, 6, PALETTE.red);
+  let next = drawParagraph(sheet, x + 12, y, item.head, 1, COLUMN_WIDTH - 12, PALETTE.ink, true);
+  next = drawParagraph(sheet, x + 12, next + 1, item.deck, 1, COLUMN_WIDTH - 12, PALETTE.grey);
+  return next + 3;
 }
 
-// A one-line brief: bullet dot and headline only, no deck.
-function storyTiny(x: number, y: number, s: Story): number {
-  render(x, y, "• " + s.h, 1, INK, true);
+// A one-line brief: a bullet dot and the headline only, no deck.
+function drawOneLiner(sheet: Sheet, x: number, y: number, item: NewsItem): number {
+  drawText(sheet, x, y, "• " + item.head, 1, PALETTE.ink, true);
   return y + 10;
 }
 
-// ---- compose the front page ---------------------------------------------
-function compose(): void {
-  // Masthead: globe, title, red date box.
-  emblem(72, 58, 40, BLUE);
-  render(132, 30, "THE WORLD TODAY", 7, INK, true);
-  box(872, 22, 124, 78, RED);
-  render(906, 30, "26", 5, PAPER, true);
-  render(910, 68, "NOV 2026", 1, PAPER, true);
-  rule(MARGIN, 116, W - 2 * MARGIN, INK, 3);
-  centre(128, "THURSDAY, 26 NOVEMBER 2026", 2, INK, true);
-  centre(150, "64 STORIES FROM EVERY REGION — ONE DAY, ONE PAGE — DATE CHECKED", 1, GREY);
-  rule(MARGIN, 168, W - 2 * MARGIN, INK, 1);
+function masthead(sheet: Sheet): void {
+  drawGlobe(sheet, 72, 58, 40, PALETTE.blue);
+  drawText(sheet, 132, 30, "THE WORLD TODAY", 7, PALETTE.ink, true);
+  sheet.fill(872, 22, 124, 78, PALETTE.red);
+  drawText(sheet, 906, 30, "26", 5, PALETTE.paper, true);
+  drawText(sheet, 910, 68, "NOV 2026", 1, PALETTE.paper, true);
+  sheet.rule(MARGIN, 116, PAGE_WIDTH - 2 * MARGIN, PALETTE.ink, 3);
+  drawCentred(sheet, 128, "THURSDAY, 26 NOVEMBER 2026", 2, PALETTE.ink, true);
+  drawCentred(
+    sheet,
+    150,
+    "64 STORIES FROM EVERY REGION — ONE DAY, ONE PAGE — DATE CHECKED",
+    1,
+    PALETTE.grey,
+  );
+  sheet.rule(MARGIN, 168, PAGE_WIDTH - 2 * MARGIN, PALETTE.ink, 1);
+}
 
-  // Lead story: Washington's new tariff plan for 14 trading partners.
+function leadStory(sheet: Sheet): void {
   let y = 182;
-  render(MARGIN, y, LEAD_KICKER, 2, RED, true);
+  drawText(sheet, MARGIN, y, LEAD_TAG, 2, PALETTE.red, true);
   y += 24;
-  for (const line of LEAD_HEAD) {
-    render(MARGIN, y, line, 4, INK, true);
+  for (const line of LEAD_LINES) {
+    drawText(sheet, MARGIN, y, line, 4, PALETTE.ink, true);
     y += 34;
   }
-  y = para(MARGIN, y + 2, LEAD_DECK, 2, 672, INK);
-  render(MARGIN, y + 4, LEAD_SOURCES, 1, GREY);
+  y = drawParagraph(sheet, MARGIN, y + 2, LEAD_DECK, 2, 672, PALETTE.ink);
+  drawText(sheet, MARGIN, y + 4, LEAD_CREDIT, 1, PALETTE.grey);
   // Cargo ship and tariff facts, right of the lead text.
-  drawShip(706, 190);
-  const facts = [
-    "14 PARTNERS NAMED",
-    "CHINA, EU, JAPAN,",
-    "INDIA, SOUTH KOREA",
-    "UP TO 35% LEVIES",
-    "CITES OVERCAPACITY",
-    "SEOUL FACES 25%",
-    "TALKS PROMISED",
-  ];
+  drawFreighter(sheet, 706, 190);
   let fy = 182;
-  for (const f of facts) {
-    render(824, fy, f, 1, INK, true);
+  for (const fact of TARIFF_FACTS) {
+    drawText(sheet, 824, fy, fact, 1, PALETTE.ink, true);
     fy += 9;
   }
-  rule(MARGIN, 344, W - 2 * MARGIN, INK, 1);
+  sheet.rule(MARGIN, 344, PAGE_WIDTH - 2 * MARGIN, PALETTE.ink, 1);
+}
 
-  // The day in UTC: six beats on a line. The strip title sits at the
-  // right end so it never collides with the first node's time label.
-  render(884, 352, "THE DAY IN UTC", 1, RED, true);
-  rule(MARGIN, 368, W - 2 * MARGIN, INK, 1);
-  TIMELINE.forEach(([t, label], i) => {
-    const nx = 60 + i * 160;
-    box(nx - 3, 365, 7, 7, RED);
-    const tw = widthOf(t, 1);
-    render(nx - Math.round(tw / 2), 354, t, 1, INK, true);
-    const lines = fit(label, 1, 156);
-    let ly = 376;
-    for (const ln of lines) {
-      render(nx - Math.round(widthOf(ln, 1) / 2), ly, ln, 1, INK);
-      ly += 9;
+function dayTimeline(sheet: Sheet): void {
+  // The strip title sits at the right end so it never collides with the
+  // first node's time label.
+  drawText(sheet, 884, 352, "THE DAY IN UTC", 1, PALETTE.red, true);
+  sheet.rule(MARGIN, 368, PAGE_WIDTH - 2 * MARGIN, PALETTE.ink, 1);
+  DAY_BEATS.forEach((beat, i) => {
+    const nodeX = 60 + i * 160;
+    sheet.fill(nodeX - 3, 365, 7, 7, PALETTE.red);
+    const whenW = textWidth(beat.when, 1);
+    drawText(sheet, nodeX - Math.round(whenW / 2), 354, beat.when, 1, PALETTE.ink, true);
+    let lineY = 376;
+    for (const line of wrapLines(beat.what, 1, 156)) {
+      drawText(sheet, nodeX - Math.round(textWidth(line, 1) / 2), lineY, line, 1, PALETTE.ink);
+      lineY += 9;
     }
   });
+}
 
-  // Pin map: a real world map pasted into the band, numbered pins, legend below.
-  drawMap();
-  for (const [n, , px, py] of PINS) {
-    box(px - 3, py - 3, 6, 6, RED);
-    render(px + 5, py - 3, n, 1, INK, true);
+function mapBand(sheet: Sheet): void {
+  const map = loadMap(new URL("./map.png", import.meta.url).pathname);
+  if (map.width !== PAGE_WIDTH - 2 * MARGIN || map.height !== 76) {
+    throw new Error(
+      "map.png is " + map.width + "x" + map.height + "; expected " + (PAGE_WIDTH - 2 * MARGIN) + "x76",
+    );
   }
-  render(MARGIN, 474, "WHERE IT HAPPENED — 1 WASHINGTON  2 CAIRO  3 JEDDAH  4 KYIV  5 SAVASLEYKA  6 CANARIES  7 MUMBAI  8 JAKARTA  9 SAN JUAN  10 HONG KONG", 1, GREY);
-  rule(MARGIN, 484, W - 2 * MARGIN, INK, 1);
+  blitMap(sheet, map, MARGIN, 394);
+  for (const pin of MAP_PINS) {
+    sheet.fill(pin.x - 3, pin.y - 3, 6, 6, PALETTE.red);
+    drawText(sheet, pin.x + 5, pin.y - 3, pin.n, 1, PALETTE.ink, true);
+  }
+  drawText(
+    sheet,
+    MARGIN,
+    474,
+    "WHERE IT HAPPENED — 1 WASHINGTON  2 CAIRO  3 JEDDAH  4 KYIV  5 SAVASLEYKA  6 CANARIES  7 MUMBAI  8 JAKARTA  9 SAN JUAN  10 HONG KONG",
+    1,
+    PALETTE.grey,
+  );
+  sheet.rule(MARGIN, 484, PAGE_WIDTH - 2 * MARGIN, PALETTE.ink, 1);
+}
 
-  // Three columns of sections. Each story carries its kind: F = feature,
-  // B = brief, T = tiny one-liner.
-  const colTop = 492;
-  let deepest = colTop;
-  COLUMNS.forEach((sections, ci) => {
-    let cy = colTop;
-    const x = COLX[ci]!;
-    for (const sec of sections) {
-      cy = sectionHead(x, cy, sec.name);
-      for (const st of sec.stories) {
-        if (st.k === "F") cy = storyFeature(x, cy, st);
-        else if (st.k === "T") cy = storyTiny(x, cy, st);
-        else cy = storyBrief(x, cy, st);
+function storyColumns(sheet: Sheet): void {
+  const top = 492;
+  let deepest = top;
+  DESKS.forEach((desks, ci) => {
+    let y = top;
+    const x = COLUMN_LEFT[ci]!;
+    for (const desk of desks) {
+      y = drawDeskHead(sheet, x, y, desk.title);
+      for (const item of desk.items) {
+        if (item.style === "feature") y = drawFeature(sheet, x, y, item);
+        else if (item.style === "one-liner") y = drawOneLiner(sheet, x, y, item);
+        else y = drawBrief(sheet, x, y, item);
       }
-      cy += 2;
+      y += 2;
     }
-    console.error("column " + ci + " ends at y=" + cy);
-    if (cy > deepest) deepest = cy;
+    console.error("column " + ci + " ends at y=" + y);
+    if (y > deepest) deepest = y;
   });
-
-  // Footer.
-  rule(MARGIN, 992, W - 2 * MARGIN, INK, 2);
-  centre(1002, "THE WORLD TODAY — THURSDAY 26 NOVEMBER 2026 — EVERY STORY REPORTED TODAY", 1, GREY);
   if (deepest > 990) console.error("WARNING: columns run to y=" + deepest);
   else console.error("columns end at y=" + deepest);
 }
 
+function pageFooter(sheet: Sheet): void {
+  sheet.rule(MARGIN, 992, PAGE_WIDTH - 2 * MARGIN, PALETTE.ink, 2);
+  drawCentred(
+    sheet,
+    1002,
+    "THE WORLD TODAY — THURSDAY 26 NOVEMBER 2026 — EVERY STORY REPORTED TODAY",
+    1,
+    PALETTE.grey,
+  );
+}
+
+function buildPage(): Sheet {
+  const sheet = new Sheet(PAGE_WIDTH, PAGE_HEIGHT, PALETTE.paper);
+  masthead(sheet);
+  leadStory(sheet);
+  dayTimeline(sheet);
+  mapBand(sheet);
+  storyColumns(sheet);
+  pageFooter(sheet);
+  return sheet;
+}
+
 function main(): void {
-  compose();
-  const out = process.env.MAKEFUN_OUTPUT_DIR || "/output";
-  mkdirSync(out, { recursive: true });
-  const target = out + "/entry.png";
-  writeFileSync(target, encodePng());
-  verifyPng(target);
+  const sheet = buildPage();
+  const dest = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+  mkdirSync(dest, { recursive: true });
+  const target = dest + "/entry.png";
+  writeFileSync(target, encodeSheet(sheet));
+  assertPng(target);
 }
 
 main();
